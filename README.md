@@ -25,7 +25,7 @@ cd opencode-resume
 ```
 
 Requires **zsh** and **sqlite3** — both preinstalled on macOS, on Debian/Ubuntu
-`apt install zsh sqlite3`. No build step, no runtime, no dependencies.
+`apt install zsh sqlite3`. No compilation step or additional application runtime is required.
 
 Then either run `oc-resume` directly, or also get `opencode -r`:
 
@@ -89,9 +89,8 @@ Worth running after you upgrade opencode, and useful in a bug report.
 
 Rules of thumb:
 
-- **Same opencode version or newer patch/minor** — works. opencode rarely changes
-  this schema within a line, so upgrading is normally a non-event.
-- **Newer opencode minor/major** — usually works. Check `schema :` in
+- **Same supported build** — the documented compatibility target. Recheck the schema after upgrading; a version number alone does not guarantee compatibility.
+- **Newer opencode minor/major** — unverified. Check `schema :` in
   `oc-resume --version`; if the tables are still there, the queries still match.
 - **Older opencode** — untested. The `session_v2` / `session_message` split dates
   from the 1.x → 2.x storage change, so pre-1.x databases will not match.
@@ -143,3 +142,6 @@ Querying SQLite gives exact directory scoping and no truncation.
 ## License
 
 MIT
+## Implementation and checks
+
+The [oc-resume script](oc-resume) contains binary discovery, read-only SQLite queries, filtering, and the picker. [test.sh](test.sh) is the verification script; inspect its database expectations before running it. Database discovery currently happens before ordinary wrapper passthrough, so a missing session database can also prevent non-resume commands from reaching the real binary.
