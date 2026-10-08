@@ -1,0 +1,501 @@
+#!/usr/bin/env zsh
+# opencode -r / --resume : pick a session and resume it, Claude Code style.
+# Any other invocation is passed straight through to the real binary.
+
+emulate -L zsh
+setopt no_unset
+
+REAL="${OPENCODE_REAL_BIN:-}"
+DB="${OPENCODE_DB:-}"
+
+# --- locate the real opencode binary (never this wrapper) -------------------
+# A wrapper is a shell script; the genuine opencode is a compiled binary. Skip
+# anything starting with "#!" so we never exec another wrapper (infinite loop).
+is_native_binary() {
+  local f=$1 head2
+  [[ -f "$f" && -x "$f" ]] || return 1
+  head2=$(dd if="$f" bs=2 count=1 2>/dev/null)
+  [[ "$head2" != "#!" ]]
+}
+
+find_real_opencode() {
+  local self="${0:A}" cand dir
+  # 1. sibling of this script, if it is a real binary
+  for cand in "${self:h}/opencode"; do
+    [[ "$cand" != "$self" ]] && is_native_binary "$cand" && { print -r -- "$cand"; return }
+  done
+  # 2. well-known install locations, newest-ish first
+  for cand in \
+      "$HOME/.opencode/bin/opencode" \
+      /opt/homebrew/bin/opencode \
+      /usr/local/bin/opencode \
+      "$HOME/.bun/bin/opencode" \
+      "$HOME/.local/bin/opencode" \
+      /opt/local/bin/opencode
+  do
+    is_native_binary "$cand" && { print -r -- "$cand"; return }
+  done
+  # 3. anything on PATH (skipping wrappers like this one)
+  dir=$(command -v opencode 2>/dev/null)
+  [[ -n "$dir" ]] && is_native_binary "$dir" && { print -r -- "$dir"; return }
+  # 4. last resort: scan PATH
+  local d
+  for d in ${(s/:/)PATH}; do
+    cand="$d/opencode"
+    [[ "$cand" != "$self" ]] && is_native_binary "$cand" && { print -r -- "$cand"; return }
+  done
+}
+
+if [[ -z "$REAL" ]]; then
+  REAL=$(find_real_opencode)
+fi
+if [[ -z "$REAL" || ! -x "$REAL" ]]; then
+  print -u2 "oc-resume: could not find the opencode binary."
+  print -u2 "Install opencode, or set OPENCODE_REAL_BIN=/path/to/opencode."
+  exit 127
+fi
+
+# --- locate opencode's session database --------------------------------------
+# Data dir follows XDG on Linux and ~/.local/share on macOS.
+if [[ -z "$DB" ]]; then
+  for cand in \
+      "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db" \
+      "$HOME/.local/share/opencode/opencode.db" \
+      "$HOME/Library/Application Support/opencode/opencode.db" \
+      "$HOME/.opencode/opencode.db"
+  do
+    [[ -r "$cand" ]] && { DB="$cand"; break }
+  done
+fi
+if [[ -z "$DB" || ! -r "$DB" ]]; then
+  print -u2 "oc-resume: could not find opencode's session database."
+  print -u2 "Looked in \$XDG_DATA_HOME/opencode and ~/.local/share/opencode."
+  print -u2 "Set OPENCODE_DB=/path/to/opencode.db to point at it directly."
+  exit 127
+fi
+
+# ---------------------------------------------------------------- arg parsing
+typeset -a passthru
+typeset -i resume=0
+
+# How we were invoked decides whether we shadow `opencode` or run standalone.
+#   oc-resume            -> standalone picker
+#   oc-resume -r         -> standalone picker (explicit)
+#   oc-resume -h|--help  -> our help
+#   opencode -r          -> picker, everything else passed through
+#   opencode ...         -> pass through untouched
+self_name=${0:t}
+if [[ "$self_name" != "opencode" ]]; then
+  resume=1
+  case "${1:-}" in
+    -h|--help) print -r -- "usage: ${self_name} [-h|--help]"; exit 0 ;;
+  esac
+else
+  for a in "$@"; do
+    case "$a" in
+      -r|--resume) resume=1 ;;
+      *) passthru+=("$a") ;;
+    esac
+  done
+  if (( ! resume )); then
+    exec "$REAL" "$@"
+  fi
+fi
+
+if ! command -v sqlite3 >/dev/null 2>&1; then
+  print -u2 "oc-resume: needs 'sqlite3' on PATH (macOS ships it; Debian/Ubuntu: apt install sqlite3)."
+  exit 127
+fi
+
+DIR=$PWD
+
+launch() {
+  if [[ -n "$1" ]]; then
+    exec "$REAL" --session "$1" "${passthru[@]}"
+  else
+    exec "$REAL" "${passthru[@]}"
+  fi
+}
+
+# ------------------------------------------------------------ load the data
+# NOTE: must be at top level — inside a function `typeset` creates a local.
+typeset query= key= k2= k3=
+typeset -i eof_tries=0 rc=0
+typeset -a ids dirs titles times outcomes agents models toks blobs
+typeset -i n=0
+
+# Read rows as JSON, not tab-separated. `IFS=$'\t' read -r a b c` COLLAPSES
+# runs of tabs, so one empty field (e.g. a session with no user message)
+# silently shifts every later field left. Here we slurp a JSON array and pull
+# the fields out with NUL delimiters, which survive empty values.
+rows_json=$(sqlite3 -readonly -noheader "$DB" "
+  WITH last_msg AS (
+    SELECT session_id,
+           substr(replace(replace(json_extract(data,'\$.text'), char(10), ' '), char(13), ' '), 1, 400) AS txt
+    FROM (
+      SELECT session_id, data,
+             row_number() OVER (PARTITION BY session_id ORDER BY seq DESC) AS rn
+      FROM session_message WHERE type = 'user'
+    ) WHERE rn = 1
+  )
+  SELECT coalesce(json_group_array(json(el)), '[]') FROM (
+    SELECT json_object(
+      'id', s.id,
+      'dir', s.directory,
+      'title', coalesce(nullif(s.title,''), '(untitled)'),
+      'time', s.time_updated,
+      'outcome', coalesce(s.idle_outcome,''),
+      'agent', CASE WHEN json_valid(s.agent)  THEN coalesce(json_extract(s.agent,'\$.name'),'') ELSE coalesce(s.agent,'')  END,
+      'model', CASE WHEN json_valid(s.model) THEN coalesce(json_extract(s.model,'\$.id'),'')  ELSE coalesce(s.model,'') END,
+      'tok', (s.tokens_input + s.tokens_output),
+      'blob', coalesce((SELECT txt FROM last_msg m WHERE m.session_id = s.id),'')
+    ) AS el
+    FROM session_v2 s
+    WHERE s.parent_id IS NULL
+    ORDER BY s.time_updated DESC
+  );
+" 2>/dev/null)
+
+typeset -a fields
+fields=()
+while IFS= read -r -d $'\0' _fv; do fields+=("$_fv"); done < <(
+  print -r -- "$rows_json" \
+    | jq -j '.[] | .id,"\u0000",.dir,"\u0000",.title,"\u0000",(.time|tostring),"\u0000",.outcome,"\u0000",.agent,"\u0000",.model,"\u0000",(.tok|tostring),"\u0000",.blob,"\u0000"'
+)
+
+typeset -i fi=1
+while (( fi + 8 <= ${#fields} )); do
+  ids+=("${fields[fi]}");       dirs+=("${fields[fi+1]}"); titles+=("${fields[fi+2]}")
+  times+=("${fields[fi+3]}");   outcomes+=("${fields[fi+4]}"); agents+=("${fields[fi+5]}")
+  models+=("${fields[fi+6]}");  toks+=("${fields[fi+7]}");   blobs+=("${fields[fi+8]}")
+  (( fi += 9 ))
+done
+n=${#ids}
+
+typeset -a allids alldirs alltitles alltimes alloutcomes allagents allmodels alltoks allblobs
+allids=("${ids[@]}"); alldirs=("${dirs[@]}"); alltitles=("${titles[@]}")
+alltimes=("${times[@]}"); alloutcomes=("${outcomes[@]}"); allagents=("${agents[@]}")
+allmodels=("${models[@]}"); alltoks=("${toks[@]}"); allblobs=("${blobs[@]}")
+n=0
+
+apply_scope() { # apply_scope <curdir|all>
+  ids=(); dirs=(); titles=(); times=(); outcomes=()
+  agents=(); models=(); toks=(); blobs=()
+  n=0
+  local k
+  for (( k = 1; k <= ${#allids}; k++ )); do
+    if [[ "$1" == "all" || "${alldirs[k]}" == "$DIR" ]]; then
+      ids+=("${allids[k]}"); dirs+=("${alldirs[k]}"); titles+=("${alltitles[k]}")
+      times+=("${alltimes[k]}"); outcomes+=("${alloutcomes[k]}"); agents+=("${allagents[k]}")
+      models+=("${allmodels[k]}"); toks+=("${alltoks[k]}"); blobs+=("${allblobs[k]}")
+      n+=1
+    fi
+  done
+}
+apply_scope curdir
+
+if (( n == 0 )); then
+  print -u2 "No sessions recorded in $DIR — starting a new one."
+  launch ""
+fi
+
+# --------------------------------------------------------------- terminal
+# tput can report the *parent* tty size; prefer an ioctl on our own stdin.
+typeset -i W LINES_TERM
+typeset -a winsize
+if [[ -t 0 ]] && winsize=( $(stty size 2>/dev/null) ) && [[ ${#winsize[@]} -eq 2 ]]; then
+  LINES_TERM=$winsize[1]; W=$winsize[2]
+else
+  W=$(tput cols 2>/dev/null) || W=100
+  LINES_TERM=$(tput lines 2>/dev/null) || LINES_TERM=24
+fi
+(( W < 52 )) && W=52
+(( W > 200 )) && W=200
+(( LINES_TERM < 12 )) && LINES_TERM=12
+
+# ---------------------------------------------------------------- colours
+typeset -a C
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C=( $'\e[1m' $'\e[2m' $'\e[7m' $'\e[38;5;244m' $'\e[38;5;39m' $'\e[38;5;42m' $'\e[38;5;214m' $'\e[0m' )
+else
+  C=( "" "" "" "" "" "" "" "" )
+fi
+BOLD=$C[1]; DIM=$C[2]; INV=$C[3]; GREY=$C[4]; BLUE=$C[5]; GRN=$C[6]; YEL=$C[7]; RST=$C[8]
+
+# ---------------------------------------------------------------- helpers
+rep() { local s=$1 k=$2 o=""; while (( k-- > 0 )); do o+=$s; done; print -rn -- "$o" }
+
+trunc() { # trunc <string> <width>
+  local s=${1//[[:cntrl:]]/ } w=$2
+  while [[ "$s" == *"  "* ]]; do s=${s//  / }; done
+  s="${s# }"
+  (( ${#s} > w )) && s="${s[1,$((w-1))]}…"
+  print -r -- "$s"
+}
+
+pad() { # pad <string> <width>
+  local s=$1 w=$2
+  (( ${#s} < w )) && s="$s$(rep ' ' $(( w - ${#s} )))"
+  print -rn -- "$s"
+}
+
+ago() {
+  local ms=$1
+  (( ms <= 0 )) && { print -r -- "?"; return }
+  local -i d=$(( $(date +%s) - ms / 1000 ))
+  (( d < 0 )) && d=0
+  local -i u s=1
+  local unit
+  if   (( d < 3600   )); then u=$(( d / 60 ))
+  elif (( d < 86400  )); then u=$(( d / 3600 ))
+  elif (( d < 604800 )); then u=$(( d / 86400 ))
+  else u=$(( d / 604800 ))
+  fi
+  (( u == 1 )) && s=0
+  if   (( d < 3600   )); then unit=minute
+  elif (( d < 86400  )); then unit=hour
+  elif (( d < 604800 )); then unit=day
+  else unit=week
+  fi
+  print -r -- "$u $unit$( (( s )) && print -n s ) ago"
+}
+
+size() { # tokens -> 46.0k
+  local v=${1:-0}
+  if   (( v >= 1000000 )); then print -r -- "$(( v / 1000000 )).$(( v % 1000000 / 100000 ))M tokens"
+  elif (( v >= 1000    )); then print -r -- "$(( v / 1000 )).$(( v % 1000 / 100 ))k tokens"
+  elif (( v > 0        )); then print -r -- "$v tokens"
+  else print -r -- "empty"
+  fi
+}
+
+# ------------------------------------------------------------------- state
+typeset -a vis
+typeset -i cur=1 scope=0
+
+refilter() {
+  vis=()
+  local q=${query:l} k
+  for (( k = 1; k <= n; k++ )); do
+    if [[ -z "$q" || "${titles[k]:l} ${blobs[k]:l} ${ids[k]:l} ${agents[k]:l} ${models[k]:l} ${dirs[k]:l}" == *"$q"* ]]; then
+      vis+=($k)
+    fi
+  done
+  (( cur > ${#vis} )) && cur=${#vis}
+  (( cur < 1 )) && cur=1
+}
+refilter
+
+# -------------------------------------------------------------------- draw
+typeset -a L
+
+draw() {
+  L=()
+  local rule; rule=$(rep "─" $W)
+
+  L+=("${GREY}${rule}${RST}")
+  local count_txt="${#vis} of ${n} session(s)"
+  local head="  ${BOLD}Resume session${RST}"
+  L+=("${head}$(pad '' $(( W - ${#head} - ${#count_txt} )))${GREY}${count_txt}${RST}")
+
+  # search box
+  local inner=$(( W - 6 ))
+  (( inner < 10 )) && inner=10
+  local qd="⌕ ${query}"
+  (( ${#qd} > inner - 2 )) && qd="${qd[1,$((inner-3))]}…"
+  local qpad=$(( inner - 1 - ${#qd} ))
+  (( qpad < 0 )) && qpad=0
+  L+=("  ${GREY}╭$(rep "─" $inner)╮${RST}")
+  L+=("  ${GREY}│${RST} ${qd}${GREY}$(rep ' ' $qpad)│${RST}")
+  L+=("  ${GREY}╰$(rep "─" $inner)╯${RST}")
+  L+=("")
+
+  if (( ${#vis} == 0 )); then
+    L+=("  ${GREY}No sessions match \"${query}\"${RST}")
+  else
+    # Rows available for the list, after the header/search/footer chrome.
+    local -i rows_avail=$(( LINES_TERM - 11 ))
+    (( rows_avail < 4 )) && rows_avail=4
+
+    # Build the whole list first, then show a window that contains `cur`.
+    # Each entry is: [group header] + title + meta + [preview on selected] + blank
+    local -a body
+    body=()
+    local -i body_sel=-1
+    local k idx last_dir=""
+    local tline meta pv
+
+    for (( k = 1; k <= ${#vis}; k++ )); do
+      idx=${vis[k]}
+
+      if [[ "${dirs[idx]}" != "$last_dir" ]]; then
+        [[ -n "$last_dir" ]] && body+=("")
+        local gname=${dirs[idx]:t}
+        [[ "${dirs[idx]}" == "$DIR" ]] && gname="${gname} (current)"
+        body+=("    ${GREY}${gname}${RST}")
+        last_dir=${dirs[idx]}
+      fi
+
+      meta="${GREY}$(ago "${times[idx]}") · ${agents[idx]} · $(size "${toks[idx]}")${RST}"
+      if [[ "$k" == "$cur" ]]; then
+        tline="  ${BOLD}${BLUE}❯ $(trunc "${titles[idx]}" $(( W - 6 )))${RST}"
+      else
+        tline="    ${GREY}  $(trunc "${titles[idx]}" $(( W - 8 )))${RST}"
+      fi
+
+      if [[ "$k" == "$cur" ]]; then
+        (( body_sel == -1 )) && body_sel=${#body}
+        body+=("$tline")
+        body+=("    ${meta}")
+        pv="${blobs[idx]}"
+        [[ -z "$pv" ]] && pv="(no user message yet)"
+        body+=("      ${GREY}↳ $(trunc "$pv" $(( W - 10 )))${RST}")
+      else
+        body+=("$tline")
+        body+=("    ${meta}")
+      fi
+      body+=("")
+    done
+
+    # Sliding window: scroll so the selected entry is fully visible.
+    # zsh arrays are 1-indexed, so `win` is a 0-based offset from body[1].
+    local -i win=0
+    local -i sel_start=$(( body_sel + 1 ))
+    local -i sel_end=$(( body_sel + 3 ))
+    (( win > sel_start - 1 )) && win=$(( sel_start - 1 ))
+    if (( win + rows_avail < sel_end )); then win=$(( sel_end - rows_avail )); fi
+    (( win < 0 )) && win=0
+    (( win > ${#body} - rows_avail )) && win=$(( ${#body} - rows_avail ))
+    (( win < 0 )) && win=0
+
+    local -i bi
+    for (( bi = win + 1; bi <= ${#body} && bi <= win + rows_avail; bi++ )); do
+      L+=("${body[bi]}")
+    done
+  fi
+
+  L+=("${GREY}${rule}${RST}")
+  local keys="  ${GREY}↑↓ move · ⏎ resume · type to search · ctrl+u clear · q cancel"
+  if (( scope == 0 )); then keys+=" · ctrl+a all projects"; else keys+=" · ctrl+n current project only"; fi
+  L+=("$keys")
+
+  print -n $'\e[H\e[2J'
+  print -rl -- "${L[@]}"
+}
+
+# ------------------------------------------------------------------- input
+if [[ ! -t 0 ]]; then
+  print -r -- "${BOLD}Sessions in $DIR${RST} ${GREY}(no TTY — pick by number)${RST}"
+  local k
+  for (( k = 1; k <= n; k++ )); do
+    print -r -- "  $k) $(ago "${times[k]}")  ${titles[k]}  ${GREY}${ids[k]}${RST}"
+  done
+  print -n "number (blank to cancel): "
+  read -r pick
+  if [[ -z "$pick" ]]; then
+    print -u2 "Cancelled."
+    exit 1
+  fi
+  if [[ "$pick" != <-> ]] || (( pick < 1 || pick > n )); then
+    print -u2 "Not a valid choice (expected 1-${n})."
+    exit 1
+  fi
+  launch "${ids[$pick]}"
+fi
+
+print -n $'\e[?1049h\e[?25l'
+stty -echo 2>/dev/null
+trap 'print -n "\e[?25h\e[?1049l"; stty echo 2>/dev/null; exit 130' INT TERM
+trap 'print -n "\e[?25h\e[?1049l"; stty echo 2>/dev/null' EXIT
+draw
+
+# Handles a single ordinary key. Split out so the escape-sequence branch can
+# hand back a byte it consumed but did not recognise.
+handle_key() {
+  case "$1" in
+    $'\r'|$'\n') return 10 ;;                  # enter -> resume
+    $'\x03'|$'\x04') return 11 ;;              # ctrl+c / ctrl+d -> cancel
+    $'\x7f'|$'\b')
+      [[ -n "$query" ]] && { query="${query[1,-2]}"; refilter; }
+      ;;
+    $'\x15') query=""; refilter ;;            # ctrl+u clears the search
+    $'\x01') if (( scope == 0 )); then scope=1; apply_scope all; else scope=0; apply_scope curdir; fi; refilter ;;
+    $'\x0e') scope=0; apply_scope curdir; refilter ;;
+    q|Q) [[ -z "$query" ]] && return 10 ;;    # q cancels when not searching
+    *) query+=${1//[[:cntrl:]]/}; refilter ;;
+  esac
+  return 0
+}
+
+while :; do
+  # NOTE: must be `read -k1 var`; `var=$(read -k1)` runs read in a subshell
+  # that cannot read the tty, so every keystroke would come back empty.
+  #
+  # A failed read must NOT be treated as "resume". Some terminals/hosts make
+  # `read -k` return non-zero transiently; retry, and only give up on real EOF.
+  if ! read -k1 key 2>/dev/null; then
+    (( eof_tries++ ))
+    (( eof_tries > 3 )) && break
+    continue
+  fi
+  eof_tries=0
+
+  case "$key" in
+    $'\e')
+      # ESC may begin a CSI/SS3 sequence (arrows, function keys) or a mouse
+      # report (ESC [ < b ; x ; y M) if the terminal still has mouse tracking
+      # enabled. Anything we do not recognise MUST be ignored -- treating it as
+      # "resume" is what made stray clicks and sequences open a session.
+      read -k1 k2 2>/dev/null
+      if [[ "$k2" == "[" || "$k2" == "O" ]]; then
+        read -k1 k3 2>/dev/null
+        case "$k3" in
+          A) (( cur > 1 )) && cur=$(( cur - 1 )) ;;
+          B) (( cur < ${#vis} )) && cur=$(( cur + 1 )) ;;
+          H) cur=1 ;;
+          F) cur=${#vis} ;;
+          '<')
+            # SGR mouse report: ESC [ < Cb ; Cx ; Cy M  -- swallow the rest so
+            # its digits do not leak into the search box.
+            local mc
+            while read -k1 mc 2>/dev/null; do
+              [[ "$mc" == "M" || "$mc" == "m" ]] && break
+            done
+            ;;
+          'M')
+            # X10 mouse report: ESC [ M <btn> <x> <y> -- three more bytes.
+            local mb
+            for mb in 1 2 3; do read -k1 mb 2>/dev/null; done
+            ;;
+          *) : ;;            # other unknown sequence -> ignore
+        esac
+      elif [[ -n "$k2" ]]; then
+        # Not a sequence: it was an ordinary key that followed a bare Esc.
+        handle_key "$k2"; rc=$?
+        (( rc == 10 )) && break
+        (( rc == 11 )) && { print -n $'\e[?25h\e[?1049l'; stty echo 2>/dev/null; trap - EXIT; launch ""; }
+      fi
+      # bare Esc with nothing after it: ignore
+      ;;
+    *)
+      handle_key "$key"; rc=$?
+      (( rc == 10 )) && break
+      (( rc == 11 )) && { print -n $'\e[?25h\e[?1049l'; stty echo 2>/dev/null; trap - EXIT; launch ""; }
+      ;;
+  esac
+
+  (( ${#vis} == 0 )) && cur=1
+  draw
+done
+
+print -n $'\e[?25h\e[?1049l'
+stty echo 2>/dev/null
+trap - EXIT INT TERM
+
+if (( cur < 1 || cur > ${#vis} )); then
+  launch ""
+fi
+
+sel=${vis[cur]}
+print -u2 "Resuming: ${titles[sel]}"
+launch "${ids[sel]}"
