@@ -1,30 +1,20 @@
 # oc-resume
 
-A session picker for [OpenCode](https://opencode.ai). Claude Code has
-`claude --resume`; OpenCode ships only `-c/--continue` (most recent) and
-`-s/--session <id>` (opaque id you have to already know). This adds the missing
-middle step: **pick one from a list.**
+A session picker for [OpenCode](https://opencode.ai).
 
-```
+Claude Code has `claude --resume`. OpenCode ships only `-c/--continue` (most
+recent) and `-s/--session <id>` (an id you have to already know). This adds the
+missing middle step: **pick one from a list.**
+
+```sh
 opencode -r          # or: oc-resume
 ```
 
-```
-──────────────────────────────────────────────────────────────
-  Resume session                                          9 of 9
-  ╭────────────────────────────────────────────────────────╮
-  │ ⌕                                                     │
-  ╰────────────────────────────────────────────────────────╯
+![The picker, showing every session grouped by project](docs/picker.png)
 
-    my-project (current)
-  ❯ fix the flaky auth test
-    2 days ago · build · 46.0k tokens
-      ↳ it fails only on CI, locally it passes every time
+Type to filter by title, last message, id, agent or model:
 
-      add pagination to /users
-    5 days ago · build · 128.4k tokens
-  ...
-```
+![Filtering the session list](docs/search.png)
 
 ## Install
 
@@ -34,19 +24,18 @@ cd opencode-resume
 ./install.sh
 ```
 
-Requires **zsh** and **sqlite3** (both preinstalled on macOS; on Debian/Ubuntu
-`apt install zsh sqlite3`). No build step, no runtime, no dependencies.
+Requires **zsh** and **sqlite3** — both preinstalled on macOS, on Debian/Ubuntu
+`apt install zsh sqlite3`. No build step, no runtime, no dependencies.
 
-Then either:
+Then either run `oc-resume` directly, or also get `opencode -r`:
 
-- run `oc-resume` directly, or
-- also get `opencode -r`:
-  ```sh
-  ln -s ~/.local/bin/oc-resume ~/.local/bin/opencode
-  ```
-  `~/.local/bin` must come **before** opencode's own `bin` directory in your
-  `PATH`, otherwise the real binary wins and `-r` is unknown to it. Reload your
-  shell afterwards (`exec $SHELL`).
+```sh
+ln -s ~/.local/bin/oc-resume ~/.local/bin/opencode
+```
+
+`~/.local/bin` must come **before** opencode's own `bin` directory in `PATH`,
+otherwise the real binary wins and `-r` is unknown to it. Reload your shell
+afterwards (`exec $SHELL`).
 
 ## Keys
 
@@ -57,14 +46,14 @@ Then either:
 | type | filter by title, last message, id, agent or model |
 | `backspace` | delete a filter character |
 | `ctrl+u` | clear the filter |
-| `1`–`9` | jump to the nth row |
 | `Home` / `End` | first / last session |
 | `ctrl+a` | toggle between this directory and all projects |
-| `q` | cancel |
-| `ctrl+c` | cancel |
+| `ctrl+n` | back to this directory only |
+| `q` | cancel (while the filter is empty) |
+| `ctrl+c` / `ctrl+d` | cancel |
 
-Without a TTY (pipes, CI, scripts) it prints a numbered list and reads a
-choice, so `printf '2\n' | oc-resume` works.
+Without a TTY (pipes, CI, scripts) it prints a numbered list and reads a choice,
+so `printf '2\n' | oc-resume` works.
 
 ## Why it reads the database directly
 
@@ -73,12 +62,12 @@ on macOS, `$XDG_DATA_HOME/opencode/opencode.db` on Linux). Reading it directly
 is ~40× faster than asking the HTTP API and, more importantly, **correct**:
 
 - `GET /api/session` returns the **50 most recently updated sessions across all
-  projects** with no scoping, and the TUI picker filters that client-side. Any
-  session older than the newest 50 machine-wide is unreachable. See
+  projects**, unscoped, and the TUI picker filters that client-side. Any session
+  older than the newest 50 machine-wide is unreachable. See
   [opencode#48974](https://github.com/anomalyco/opencode/issues/48974).
-- `session.message.list` truncates large responses (Bun's `keepAliveTimeout`
-  cuts the body mid-stream — see [opencode#50507](https://github.com/anomalyco/opencode/pull/50507)), so
-  the last message can come back empty for big sessions.
+- `session.message.list` truncates large responses — Bun's `keepAliveTimeout`
+  cuts the body mid-stream ([opencode#50507](https://github.com/anomalyco/opencode/pull/50507)) —
+  so the last message can come back empty for big sessions.
 
 Querying SQLite gives exact directory scoping and no truncation.
 
@@ -95,10 +84,10 @@ Querying SQLite gives exact directory scoping and no truncation.
 
 - Reads a **private schema** (`session_v2`, `session_message`). An opencode
   migration that renames those will break it; it fails with a clear message
-  rather than silently. Recovery: `opencode session list` then
+  rather than silently. Recovery: `opencode session list`, then
   `opencode -s <id>`.
 - Git **branch is not stored per session** in opencode's schema, so it is not
-  shown. The header shows the current branch of the current directory.
+  shown.
 - Sessions are matched to a directory by exact path, so sessions started in
   `~/proj/app` are not listed from `~/proj`. Use `ctrl+a` to see everything.
 - macOS/Linux only: it is a zsh script and needs `sqlite3`.
