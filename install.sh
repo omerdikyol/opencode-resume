@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 # Install oc-resume. Optionally shadow `opencode` so `opencode -r` works.
 #
-#   curl -fsSL <raw-url>/install.sh | sh            # standalone `oc-resume`
-#   curl -fsSL <raw-url>/install.sh | sh -s -- --shadow   # also `opencode -r`
+#   ./install.sh              # standalone `oc-resume`
+#   ./install.sh --shadow     # also print instructions for `opencode -r`
 #
 set -eu
 
@@ -54,10 +54,12 @@ else
 fi
 
 if [ "$SHADOW" -eq 1 ]; then
+  ln -sf "$INSTALL_DIR/$BIN_NAME" "$INSTALL_DIR/opencode" 2>/dev/null \
+    && echo "linked $INSTALL_DIR/opencode -> $BIN_NAME"
   echo
-  echo "To make 'opencode -r' work, put a wrapper named 'opencode' earlier in PATH:"
-  echo "  ln -s $INSTALL_DIR/$BIN_NAME $INSTALL_DIR/opencode"
-  echo "then ensure $INSTALL_DIR comes before opencode's own bin dir, and run: exec \$SHELL"
+  echo "For 'opencode -r' to work, $INSTALL_DIR must come BEFORE opencode's own"
+  echo "bin directory in PATH. Check with:  which -a opencode"
+  echo "Then reload your shell:             exec \$SHELL"
 fi
 
 echo
