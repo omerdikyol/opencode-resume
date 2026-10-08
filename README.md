@@ -81,6 +81,27 @@ oc-resume 1.0.0 (2026-10-08)
 
 Worth running after you upgrade opencode, and useful in a bug report.
 
+### Tested versions
+
+| oc-resume | released | developed against | opencode schema read | status |
+|---|---|---|---|---|
+| 1.0.0 | 2026-10-08 | v2.0.24 | `session_v2`, `session_message` | current |
+
+Rules of thumb:
+
+- **Same opencode version or newer patch/minor** — works. opencode rarely changes
+  this schema within a line, so upgrading is normally a non-event.
+- **Newer opencode minor/major** — usually works. Check `schema :` in
+  `oc-resume --version`; if the tables are still there, the queries still match.
+- **Older opencode** — untested. The `session_v2` / `session_message` split dates
+  from the 1.x → 2.x storage change, so pre-1.x databases will not match.
+- **Schema moved or renamed** — this is the one real break. The script fails with
+  an explicit message instead of silently showing an empty list. Recovery:
+  `opencode session list`, then `opencode -s <id>`.
+
+If a future opencode breaks it, the fix is normally a few lines in the single
+`rows_json` query near the top of [`oc-resume`](oc-resume).
+
 ## Why it reads the database directly
 
 Sessions live in opencode's SQLite store (`~/.local/share/opencode/opencode.db`
@@ -108,10 +129,11 @@ Querying SQLite gives exact directory scoping and no truncation.
 
 ## Caveats
 
-- Reads a **private schema** (`session_v2`, `session_message`). An opencode
-  migration that renames those will break it; it fails with a clear message
-  rather than silently. Recovery: `opencode session list`, then
-  `opencode -s <id>`.
+- Reads a **private schema** (`session_v2`, `session_message`), tied to the
+  opencode version listed in the table above. An opencode migration that renames
+  those will break it; it fails with a clear message rather than silently.
+  Recovery: `opencode session list`, then `opencode -s <id>`.
+  Verify any time with `oc-resume --version`.
 - Git **branch is not stored per session** in opencode's schema, so it is not
   shown.
 - Sessions are matched to a directory by exact path, so sessions started in
