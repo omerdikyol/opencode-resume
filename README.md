@@ -55,6 +55,32 @@ afterwards (`exec $SHELL`).
 Without a TTY (pipes, CI, scripts) it prints a numbered list and reads a choice,
 so `printf '2\n' | oc-resume` works.
 
+## Version and compatibility
+
+oc-resume reads opencode's private schema, so each release is pinned to the
+opencode build it was developed on:
+
+```console
+$ oc-resume --version
+oc-resume 1.0.0 (2026-10-08)
+  developed against : opencode v2.0.24
+  installed opencode: v2.0.24
+  database          : /Users/you/.local/share/opencode/opencode.db
+  schema            : ok (session_v2, session_message)
+```
+
+- **developed against** — the opencode version this release was built and tested
+  on. It lives in the `OC_RESUME_OPENCODE` constant in [`oc-resume`](oc-resume)
+  and is bumped when an opencode release moves the `session_v2` /
+  `session_message` schema.
+- **installed opencode** — what you actually have. `untested with this release`
+  is a warning, not an error; it usually still works.
+- **schema** — a live, read-only check that the tables this script reads still
+  exist. If opencode migrates them away, you get a message instead of a picker
+  that silently lists nothing.
+
+Worth running after you upgrade opencode, and useful in a bug report.
+
 ## Why it reads the database directly
 
 Sessions live in opencode's SQLite store (`~/.local/share/opencode/opencode.db`

@@ -74,6 +74,47 @@ if [[ -z "$DB" || ! -r "$DB" ]]; then
   exit 127
 fi
 
+# ------------------------------------------------------------------ version
+# Bump OC_RESUME_VERSION + OC_RESUME_DATE on every release, and OC_RESUME_OPENCODE
+# whenever the private schema it reads (session_v2 / session_message) moves.
+typeset -r OC_RESUME_VERSION=1.0.0
+typeset -r OC_RESUME_DATE=2026-10-08
+typeset -r OC_RESUME_OPENCODE=2.0.24
+
+installed_opencode() { "$REAL" --version 2>/dev/null | head -1 }
+
+# "2.0.24" out of "opencode v2.0.24", or empty if it cannot be determined.
+oc_semver() { print -r -- "${1##*v}"; }
+
+schema_state() {
+  local t
+  t=$(sqlite3 -readonly "$DB" "
+    SELECT count(*) FROM sqlite_master
+    WHERE type='table' AND name IN ('session_v2','session_message');" 2>/dev/null)
+  case "$t" in
+    2) print -r -- "ok (session_v2, session_message)" ;;
+    1) print -r -- "INCOMPLETE: found only 1 of session_v2 / session_message" ;;
+    *) print -r -- "UNKNOWN: no session_v2 / session_message tables" ;;
+  esac
+}
+
+print_version() {
+  local have want
+  have=$(oc_semver "$(installed_opencode)")
+  want=$OC_RESUME_OPENCODE
+  print -r -- "oc-resume $OC_RESUME_VERSION ($OC_RESUME_DATE)"
+  print -r -- "  developed against : opencode v$want"
+  if [[ -z "$have" ]]; then
+    print -r -- "  installed opencode: unknown ($REAL did not report a version)"
+  elif [[ "$have" == "$want" ]]; then
+    print -r -- "  installed opencode: v$have"
+  else
+    print -r -- "  installed opencode: v$have  <- untested with this release"
+  fi
+  print -r -- "  database          : $DB"
+  print -r -- "  schema            : $(schema_state)"
+}
+
 # ---------------------------------------------------------------- arg parsing
 typeset -a passthru
 typeset -i resume=0
@@ -82,13 +123,17 @@ typeset -i resume=0
 #   oc-resume            -> standalone picker
 #   oc-resume -r         -> standalone picker (explicit)
 #   oc-resume -h|--help  -> our help
+#   oc-resume -V|--version -> our version
 #   opencode -r          -> picker, everything else passed through
 #   opencode ...         -> pass through untouched
+# A bare `opencode -V` must reach the real binary, so only claim -V once we know
+# the picker is what runs.
 self_name=${0:t}
 if [[ "$self_name" != "opencode" ]]; then
   resume=1
   case "${1:-}" in
-    -h|--help) print -r -- "usage: ${self_name} [-h|--help]"; exit 0 ;;
+    -h|--help) print -r -- "usage: ${self_name} [-h|--help] [-V|--version]"; exit 0 ;;
+    -V|--version) print_version; exit 0 ;;
   esac
 else
   for a in "$@"; do
@@ -100,6 +145,11 @@ else
   if (( ! resume )); then
     exec "$REAL" "$@"
   fi
+  for a in "${passthru[@]}"; do
+    case "$a" in
+      -V|--version) print_version; exit 0 ;;
+    esac
+  done
 fi
 
 if ! command -v sqlite3 >/dev/null 2>&1; then
