@@ -1,4 +1,10 @@
-# oc-resume
+<h1 align="center">oc-resume</h1>
+
+<p align="center">
+  <img alt="shell: zsh" src="https://img.shields.io/badge/shell-zsh-lightgrey">
+  <img alt="storage: SQLite" src="https://img.shields.io/badge/storage-SQLite-003B57">
+  <img alt="license: MIT" src="https://img.shields.io/badge/license-MIT-green">
+</p>
 
 A session picker for [OpenCode](https://opencode.ai).
 
